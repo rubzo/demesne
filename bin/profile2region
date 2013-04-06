@@ -1,0 +1,363 @@
+#!/usr/bin/env python
+#
+# profile2region
+# by stephen kyle
+#
+
+import re, argparse, pprint
+
+class Exit:
+	def __init__(self, count, offset):
+		self.count = count
+		self.offset = offset
+		self.nextTrace = None
+		self.hotness = 0
+
+	def addNextTrace(self, trace):
+		self.nextTrace = trace
+		self.hotness = self.count * trace.size
+
+	def __repr__(self):
+		return "E: 0x%x %d" % (self.offset, self.count)
+	
+class Invoke:
+	def __init__(self, count, method):
+		self.count = count
+		self.method = method
+
+# not actually used yet
+class Exception:
+	def __init__(self, count, offset):
+		self.count = count
+		self.offset = offset
+
+# not actually used yet
+class Return:
+	def __init__(self, count, offset):
+		self.count = count
+		self.offset = offset
+
+class Trace:
+	def __init__(self, count, offset, method, size):
+		# Execution count
+		self.count = count
+		self.orig_count = count
+		# Code-word offset into method
+		self.offset = offset
+		# Full method name
+		self.method = method
+		# Number of instructions
+		self.size = size
+
+		self.exits = list()
+		self.invokes = list()
+		self.exceptions = list()
+		self.returns = list()
+
+		self.recalculateDynamicRuntime()
+		self.orig_dynamicRuntime = self.dynamicRuntime
+
+	def addExit(self, count, offset):
+		self.exits.append(Exit(count, offset))
+
+	def recalculateDynamicRuntime(self):
+		self.dynamicRuntime = self.count * self.size
+
+	def getExitCount(self, offset):
+		for exit in self.exits:
+			if exit.offset == offset:
+				return exit.count
+		return -1
+
+	def __repr__(self):
+		return "(T: m:%s+0x%x s:%d c:%d (r:%d) e:%s)" % (self.method, self.offset, self.size, self.orig_count, self.orig_dynamicRuntime, self.exits)
+
+class Region:
+	def __init__(self):
+		self.entry = None
+		self.traces = []
+		pass
+
+	def addEntry(self, trace):
+		self.entry = trace
+
+	def extend(self, trace):
+		self.traces.append(trace)
+
+	def containsOffset(self, offset):
+		if self.entry.offset == offset:
+			return True
+		for trace in self.traces:
+			if trace.offset == offset:
+				return True
+		return False
+	
+	def __repr__(self):
+		s = "R:\n  Entry: %s" % self.entry
+		for trace in self.traces:
+			s += "\n         %s" % trace
+		return s
+
+# MAP { methodName : { offset : trace } }
+traceLookup = {}
+# All traces
+traces = []
+# Trace we're currently adding info to
+currentTrace = None
+# The merged regions we're creating
+regions = []
+# Used traces
+usedTraces = []
+
+OFFSET_SIZE_RE = re.compile("\[0?x?([0-9a-fA-F]+)\(\+(\d+)\),")
+def handleTrace(line):
+	vals = line.split()
+
+	count = int(vals[2])
+	method = vals[6]
+
+	# use a regex to parse i.e. [0x53(+3),
+	mo = OFFSET_SIZE_RE.match(vals[4])
+	offset = int(mo.group(1), 16)
+	size = int(mo.group(2))
+
+	global currentTrace
+	currentTrace = Trace(count, offset, method, size) 
+	traces.append(currentTrace)
+
+EXIT_OFFSET_RE = re.compile("0?x?([0-9A-Fa-f]+)\]")
+def handleExit(line):
+	vals = line.split()
+
+	count = int(vals[3])
+	mo = EXIT_OFFSET_RE.match(vals[2])
+	offset = int(mo.group(1), 16)
+
+	if (currentTrace != None):
+		currentTrace.addExit(count, offset)
+
+def handleInvoke(line):
+	pass
+
+def process(line):
+	line = line.lstrip().rstrip()
+	if (line.startswith('TRACEPROFILE')):
+		if (line != 'TRACEPROFILE NULL'):
+			handleTrace(line)
+	elif (line.startswith('EXIT')):
+		handleExit(line)
+	elif (line.startswith('INVOKE')):
+		handleInvoke(line)
+
+def loadProfile(filename):
+	f = open(filename, "r")
+	for line in f.readlines():
+		process(line)
+	f.close()
+
+def writeRegionFile(regions, filename):
+	f = open(filename, "w")
+	f.write("# Write unique app name here\n")
+	f.write("app <here>\n\n")
+	f.write("# Insert arguments here\n")
+	f.write("#arm\n")
+	f.write("#debugfuncs\n")
+	f.write("#ehcounter\n")
+	f.write("\n# Regions:\n")
+	for region in regions:
+		f.write("\nregion\n")
+		f.write("method %s\n" % region.entry.method)
+		f.write("entry 0x%x\n" % region.entry.offset)
+		for trace in region.traces:
+			f.write("merge 0x%x\n" % trace.offset)
+		f.write("end_region\n")
+	f.close()
+
+def v(msg):
+	if args.verbose:
+		print("[v] " + msg)
+
+def list2hex(l):
+	s = "["
+	if (len(l) == 0):
+		return "[]"
+	for i in l[:-1]:
+		s += "0x%x, " % i
+	s += "0x%x]" % l[-1]
+	return s
+
+def updateExits(exits, trace, region):
+	exits.extend(trace.exits)
+	# Remove all exits that were never actually JIT'd
+	exits = filter(lambda e: e.offset in traceLookup[trace.method], exits)
+	assert(filter(lambda e: e.nextTrace == None, exits) == [])
+	# Look for any exits that loops back into this region
+	loopExits = []
+	for exit in exits:
+		if region.containsOffset(exit.offset):
+			loopExits.append(exit)
+	if loopExits != []:
+		v("  Trace loops to self, ignoring false exit.")
+		for loopExit in loopExits:
+			exits.remove(loopExit)
+	exits = sorted(exits, key=lambda e: e.hotness, reverse=True)
+	v("  Exits from region: %s" % exits)
+	return exits
+	
+def getRegionsRuntime(regions):
+	uniqueTraces = list()
+	for region in regions:
+		if region.entry not in uniqueTraces:
+			uniqueTraces.append(region.entry)
+		for trace in region.traces:
+			if trace not in uniqueTraces:
+				uniqueTraces.append(trace)
+	regionsRuntime = 0
+	for trace in uniqueTraces:
+		regionsRuntime += trace.orig_dynamicRuntime
+	return regionsRuntime
+
+def createOffsetMap(regions):
+	offsetMap = {}
+	for region in regions:
+		if region.entry.method not in offsetMap:
+			offsetMap[region.entry.method] = [region.entry.offset]
+		else:
+			offsetMap[region.entry.method].append(region.entry.offset)
+	return offsetMap
+
+def getAdjustment(offsetMap, method, offset):
+	if (method not in offsetMap):
+		return 0
+	methodMap = offsetMap[method]
+	res = 0
+	while (res < len(methodMap)):
+		if offset <= methodMap[res]:
+			return res
+		res += 1
+	return len(methodMap)
+
+
+# Start off by parsing arguments
+parser = argparse.ArgumentParser(description='Convert profile files into regions for AOT generation.')
+parser.add_argument('-i', help='Input file', dest='inputFile', type=str, required=True)
+parser.add_argument('-o', help='Output file', dest='outputFile', type=str, required=True)
+parser.add_argument('-d', help='Injection Description File', dest='injectionDescriptionFile', type=str, required=True)
+parser.add_argument('-v', help='Verbose?', dest='verbose', action='store_const', const=True, default=False)
+parser.add_argument('-s', help='Show regions?', dest='showRegions', action='store_const', const=True, default=False)
+parser.add_argument('-p', help='Percentage of JIT runtime', dest='percentage', type=float, default=90.0)
+args = parser.parse_args()
+
+# Load the profile file
+loadProfile(args.inputFile)
+
+# Create lookup structure, as well as calculating totalRuntime
+totalRuntime = 0
+for trace in traces:
+	totalRuntime += trace.dynamicRuntime
+	if trace.method not in traceLookup:
+		traceLookup[trace.method] = { trace.offset : trace }
+	else:
+		traceLookup[trace.method][trace.offset] = trace
+
+# Associate exits with the trace that follows them
+for trace in traces:
+	for exit in trace.exits:
+		if (exit.offset in traceLookup[trace.method]):
+			exit.addNextTrace(traceLookup[trace.method][exit.offset])
+
+# Calculate our runtime threshold
+desiredPercentage = args.percentage / 100.0
+desiredRuntime = int(float(totalRuntime) * desiredPercentage)
+
+# Sort traces by dynamic runtime
+traces = sorted(traces, key=lambda t: t.dynamicRuntime, reverse=True)
+
+# Keep creating new regions until we've accounted for a large enough percentage
+currentRuntime = 0
+while (currentRuntime < desiredRuntime):
+	# Make a new region
+	region = Region()
+	regions.append(region)
+
+	# Get the hottest trace for our new region
+	topTrace = traces.pop(0)
+	v("Choosing trace %s" % topTrace)
+	region.addEntry(topTrace)
+	if (topTrace not in usedTraces):
+		usedTraces.append(topTrace)
+
+	# Update and check current runtime
+	currentRuntime = getRegionsRuntime(regions)
+	v("  Increasing total runtime taken to %f%% of estimated JIT trace runtime." % (float(100 * currentRuntime) / totalRuntime, ))
+	if (currentRuntime >= desiredRuntime):
+		v("  Reached threshold after adding new trace.")
+		break
+
+	# Our list of exits, add the exits from our initial trace
+	exits = []
+	# (updateExits will also sort them by hotness)
+	exits = updateExits(exits, topTrace, region)
+
+	while (exits != []):
+		# Get the hottest exit 
+		exit = exits.pop(0)
+		nextTrace = traceLookup[topTrace.method][exit.offset]
+		region.extend(nextTrace)
+		if (nextTrace not in usedTraces):
+			usedTraces.append(nextTrace)
+		v("  Merging in trace %s" % nextTrace)
+		currentRuntime = getRegionsRuntime(regions)
+		v("    Increasing total runtime taken to %f%% of estimated JIT trace runtime." % (float(100 * currentRuntime) / totalRuntime, ))
+
+		nextTrace.count -= exit.count
+		v("    Decreasing execution count for this trace to %d." % nextTrace.count)
+		nextTrace.recalculateDynamicRuntime()
+
+		exits = updateExits(exits, nextTrace, region)
+
+		if (currentRuntime >= desiredRuntime):
+			v("  Reached threshold during merge.")
+			break
+
+	v("  Finished merging this trace.")
+
+	# Resort the main list of traces, so that the most significant trace is picked next
+	traces = sorted(traces, key=lambda t: t.dynamicRuntime, reverse=True)
+
+v("Reached threshold!")
+
+print("=== COMPLETE ===")
+
+# Sort regions so that they are sorted by entry's (method, offset)
+regions = sorted(regions, key=lambda r: r.entry.offset)
+regions = sorted(regions, key=lambda r: r.entry.method)
+
+print("Merging represents %f%% of estimated JIT trace runtime." % (float(100 * currentRuntime) / totalRuntime, ))
+
+# Every region that is created requires a itrace-inject bytecode be added
+# to the dalvik bytecode. Therefore, we need to adjust the offsets of any
+# trace that comes after where such an instruction may be inserted.
+print("Creating injection description file...")
+f = open(args.injectionDescriptionFile, "w")
+offsetMap = createOffsetMap(regions)
+regionIndex = 0
+for region in regions:
+	f.write("%d %s %x" % (regionIndex, region.entry.method, region.entry.offset))
+	regionIndex += 1
+for trace in usedTraces:
+	trace.offset += getAdjustment(offsetMap, trace.method, trace.offset)
+	for exit in trace.exits:
+		exit.offset += getAdjustment(offsetMap, trace.method, exit.offset)
+f.close()
+
+# Display regions, if needed
+if (args.showRegions):
+	for region in regions:
+		print(region)
+
+# Produce the region file
+print("Creating region file...")
+writeRegionFile(regions, args.outputFile)
+
+print("Created %d region%s." % (len(regions), "" if len(regions) == 1 else "s"))
