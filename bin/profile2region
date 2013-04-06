@@ -343,7 +343,7 @@ f = open(args.injectionDescriptionFile, "w")
 offsetMap = createOffsetMap(regions)
 regionIndex = 0
 for region in regions:
-	f.write("%d %s %x" % (regionIndex, region.entry.method, region.entry.offset))
+	f.write("%d %s %x\n" % (regionIndex, region.entry.method, region.entry.offset))
 	regionIndex += 1
 for trace in usedTraces:
 	trace.offset += getAdjustment(offsetMap, trace.method, trace.offset)
