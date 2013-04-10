@@ -242,7 +242,6 @@ def getAdjustment(offsetMap, method, offset):
 parser = argparse.ArgumentParser(description='Convert profile files into regions for AOT generation.')
 parser.add_argument('-i', help='Input file', dest='inputFile', type=str, required=True)
 parser.add_argument('-o', help='Output file', dest='outputFile', type=str, required=True)
-parser.add_argument('-d', help='Injection Description File', dest='injectionDescriptionFile', type=str, required=True)
 parser.add_argument('-v', help='Verbose?', dest='verbose', action='store_const', const=True, default=False)
 parser.add_argument('-s', help='Show regions?', dest='showRegions', action='store_const', const=True, default=False)
 parser.add_argument('-p', help='Percentage of JIT runtime', dest='percentage', type=float, default=90.0)
@@ -334,22 +333,6 @@ regions = sorted(regions, key=lambda r: r.entry.offset)
 regions = sorted(regions, key=lambda r: r.entry.method)
 
 print("Merging represents %f%% of estimated JIT trace runtime." % (float(100 * currentRuntime) / totalRuntime, ))
-
-# Every region that is created requires a itrace-inject bytecode be added
-# to the dalvik bytecode. Therefore, we need to adjust the offsets of any
-# trace that comes after where such an instruction may be inserted.
-print("Creating injection description file...")
-f = open(args.injectionDescriptionFile, "w")
-offsetMap = createOffsetMap(regions)
-regionIndex = 0
-for region in regions:
-	f.write("%d %s %x\n" % (regionIndex, region.entry.method, region.entry.offset))
-	regionIndex += 1
-for trace in usedTraces:
-	trace.offset += getAdjustment(offsetMap, trace.method, trace.offset)
-	for exit in trace.exits:
-		exit.offset += getAdjustment(offsetMap, trace.method, exit.offset)
-f.close()
 
 # Display regions, if needed
 if (args.showRegions):
